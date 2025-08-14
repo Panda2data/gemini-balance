@@ -259,3 +259,7 @@ $RECYCLE.BIN/
 
 tests/
 default_db
+data/gemini_balance.db
+start_app.bat
+start_hidden.vbs
+data/test.txt

@@ -109,6 +109,11 @@ class Settings(BaseSettings):
     # 假流式配置 (Fake Streaming Configuration)
     FAKE_STREAM_ENABLED: bool = False  # 是否启用假流式输出
     FAKE_STREAM_EMPTY_DATA_INTERVAL_SECONDS: int = 5  # 假流式发送空数据的间隔时间（秒）
+    
+    # 并发控制配置
+    CONCURRENT_REQUEST_LIMIT: int = 3  # 最大并发请求数
+    REQUEST_QUEUE_SIZE: int = 20  # 请求队列大小
+    REQUEST_TIMEOUT: int = 30  # 请求超时时间（秒）
 
     # 调度器配置
     CHECK_INTERVAL_HOURS: int = 1  # 默认检查间隔为1小时

@@ -5,8 +5,9 @@ import datetime
 import json
 import re
 import time
+import uuid
 from copy import deepcopy
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 from app.config.config import settings
 from app.core.constants import GEMINI_2_FLASH_EXP_SAFETY_SETTINGS
@@ -20,6 +21,7 @@ from app.handler.response_handler import OpenAIResponseHandler
 from app.handler.stream_optimizer import openai_optimizer
 from app.log.logger import get_openai_logger
 from app.service.client.api_client import GeminiApiClient
+from app.service.chat.request_queue import request_queue
 from app.service.image.image_create_service import ImageCreateService
 from app.service.key.key_manager import KeyManager
 
@@ -237,6 +239,7 @@ class OpenAIChatService:
         self.api_client = GeminiApiClient(base_url, settings.TIME_OUT)
         self.key_manager = key_manager
         self.image_create_service = ImageCreateService()
+        self.request_queue = request_queue
 
     def _extract_text_from_openai_chunk(self, chunk: Dict[str, Any]) -> str:
         """从OpenAI响应块中提取文本内容"""
@@ -266,13 +269,33 @@ class OpenAIChatService:
         messages, instruction = self.message_converter.convert(request.messages)
 
         payload = _build_payload(request, messages, instruction)
-
-        if request.stream:
-            return self._handle_stream_completion(request.model, payload, api_key)
-        return await self._handle_normal_completion(request.model, payload, api_key)
+        
+        # 生成请求ID用于日志和跟踪
+        request_id = str(uuid.uuid4())
+        logger.info(f"Request {request_id}: Processing chat completion for model {request.model}")
+        
+        try:
+            # 将请求添加到队列并等待处理许可
+            queue_id, future = await self.request_queue.add_request(request.model, payload, api_key)
+            logger.info(f"Request {request_id} queued as {queue_id}")
+            
+            # 等待队列处理许可
+            await asyncio.wait_for(future, timeout=settings.REQUEST_TIMEOUT)
+            logger.info(f"Request {request_id} ({queue_id}) received processing permission")
+            
+            if request.stream:
+                return self._handle_stream_completion(request.model, payload, api_key, request_id)
+            return await self._handle_normal_completion(request.model, payload, api_key, request_id)
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Request {request_id} timed out waiting in queue")
+            raise TimeoutError("Request timed out in queue. The system is currently experiencing high load.")
+        except Exception as e:
+            logger.error(f"Request {request_id} failed in queue: {str(e)}")
+            raise
 
     async def _handle_normal_completion(
-        self, model: str, payload: Dict[str, Any], api_key: str
+        self, model: str, payload: Dict[str, Any], api_key: str, request_id: str = None
     ) -> Dict[str, Any]:
         """处理普通聊天完成"""
         start_time = time.perf_counter()
@@ -280,12 +303,15 @@ class OpenAIChatService:
         is_success = False
         status_code = None
         response = None
+        req_id = request_id or str(uuid.uuid4())  # 确保有请求ID
         
         try:
+            logger.info(f"Request {req_id}: Sending non-streaming request to model {model}")
             response = await self.api_client.generate_content(payload, model, api_key)
             usage_metadata = response.get("usageMetadata", {})
             is_success = True
             status_code = 200
+            logger.info(f"Request {req_id}: Received successful response from model {model}")
             
             # 尝试处理响应，捕获可能的响应处理异常
             try:
@@ -296,34 +322,64 @@ class OpenAIChatService:
                     finish_reason="stop",
                     usage_metadata=usage_metadata,
                 )
+                logger.info(f"Request {req_id}: Successfully processed response for model {model}")
                 return result
             except Exception as response_error:
-                logger.error(f"Response processing failed for model {model}: {str(response_error)}")
+                logger.error(f"Request {req_id}: Response processing failed for model {model}: {str(response_error)}")
                 
                 # 记录详细的错误信息
                 if "parts" in str(response_error):
-                    logger.error("Response structure issue - missing or invalid parts")
+                    logger.error(f"Request {req_id}: Response structure issue - missing or invalid parts")
                     if response.get("candidates"):
                         candidate = response["candidates"][0]
                         content = candidate.get("content", {})
-                        logger.error(f"Content structure: {content}")
+                        logger.error(f"Request {req_id}: Content structure: {content}")
                 
-                # 重新抛出异常
-                raise response_error
+                # 检查是否是"No parts found"错误，如果是则尝试重试
+                if "parts" in str(response_error) or "No parts found" in str(response_error):
+                    logger.warning(f"Request {req_id}: Detected 'No parts found' error, likely due to concurrent requests")
+                    # 抛出特定异常以触发重试
+                    raise ValueError(f"No parts found in response, triggering retry: {str(response_error)}")
+                else:
+                    # 重新抛出其他类型的异常
+                    raise response_error
+                
+        except ValueError as ve:
+            # 处理特定的"No parts found"错误
+            if "No parts found" in str(ve) or "parts" in str(ve):
+                is_success = False
+                error_log_msg = str(ve)
+                logger.error(f"Request {req_id}: API call failed with parts error for model {model}: {error_log_msg}")
+                # 如果有KeyManager，尝试获取新的API密钥
+                if self.key_manager:
+                    try:
+                        # 传递错误类型信息给handle_api_failure方法
+                        new_key = await self.key_manager.handle_api_failure(api_key, 1, str(ve))
+                        if new_key and new_key != api_key:
+                            logger.info(f"Request {req_id}: Retrying with new API key due to 'No parts found' error")
+                            # 使用新密钥重试
+                            return await self._handle_normal_completion(model, payload, new_key, req_id)
+                    except Exception as key_error:
+                        logger.error(f"Request {req_id}: Error while getting new API key: {str(key_error)}")
+                # 如果无法获取新密钥或重试失败，重新抛出异常
+                raise ve
+            else:
+                # 其他ValueError类型，按常规异常处理
+                raise
                 
         except Exception as e:
             is_success = False
             error_log_msg = str(e)
-            logger.error(f"API call failed for model {model}: {error_log_msg}")
+            logger.error(f"Request {req_id}: API call failed for model {model}: {error_log_msg}")
             
             # 特别记录 max_tokens 相关的错误
             gen_config = payload.get('generationConfig', {})
             if "maxOutputTokens" in gen_config:
-                logger.error(f"Request had maxOutputTokens: {gen_config['maxOutputTokens']}")
+                logger.error(f"Request {req_id}: Request had maxOutputTokens: {gen_config['maxOutputTokens']}")
             
             # 如果是响应处理错误，记录更多信息
             if "parts" in error_log_msg:
-                logger.error("This is likely a response processing error")
+                logger.error(f"Request {req_id}: This is likely a response processing error")
             
             match = re.search(r"status code (\d+)", error_log_msg)
             status_code = int(match.group(1)) if match else 500
@@ -352,13 +408,16 @@ class OpenAIChatService:
             )
 
     async def _fake_stream_logic_impl(
-        self, model: str, payload: Dict[str, Any], api_key: str
+        self, model: str, payload: Dict[str, Any], api_key: str, request_id: str = None
     ) -> AsyncGenerator[str, None]:
         """处理伪流式 (fake stream) 的核心逻辑"""
+        req_id = request_id or str(uuid.uuid4())  # 确保有请求ID
         logger.info(
-            f"Fake streaming enabled for model: {model}. Calling non-streaming endpoint."
+            f"Request {req_id}: Fake streaming enabled for model: {model}. Calling non-streaming endpoint."
         )
         keep_sending_empty_data = True
+        # 重置内容标记
+        self._stream_had_content = False
 
         async def send_empty_data_locally() -> AsyncGenerator[str, None]:
             """定期发送空数据以保持连接"""
@@ -393,9 +452,19 @@ class OpenAIChatService:
             keep_sending_empty_data = False
 
         if response and response.get("candidates"):
-            response = self.response_handler.handle_response(response, model, stream=True, finish_reason='stop', usage_metadata=response.get("usageMetadata", {}))
-            yield f"data: {json.dumps(response)}\n\n"
-            logger.info(f"Sent full response content for fake stream: {model}")
+            try:
+                response_data = self.response_handler.handle_response(response, model, stream=True, finish_reason='stop', usage_metadata=response.get("usageMetadata", {}))
+                # 标记已处理有效内容
+                self._stream_had_content = True
+                yield f"data: {json.dumps(response_data)}\n\n"
+                logger.info(f"Request {req_id}: Sent full response content for fake stream: {model}")
+            except ValueError as ve:
+                # 捕获并重新抛出 "No parts found" 错误，让上层处理
+                if "No parts found" in str(ve):
+                    logger.warning(f"Request {req_id}: {str(ve)}")
+                    raise ValueError(f"Request {req_id}: {str(ve)}")
+                # 其他 ValueError 也重新抛出
+                raise
         else:
             error_message = "Failed to get response from model"
             if (
@@ -412,11 +481,15 @@ class OpenAIChatService:
             yield f"data: {json.dumps(error_chunk)}\n\n"
 
     async def _real_stream_logic_impl(
-        self, model: str, payload: Dict[str, Any], api_key: str
+        self, model: str, payload: Dict[str, Any], api_key: str, request_id: str = None
     ) -> AsyncGenerator[str, None]:
         """处理真实流式 (real stream) 的核心逻辑"""
+        req_id = request_id or str(uuid.uuid4())  # 确保有请求ID
+        logger.info(f"Request {req_id}: Starting real stream for model: {model}")
         tool_call_flag = False
         usage_metadata = None
+        # 重置内容标记
+        self._stream_had_content = False
         async for line in self.api_client.stream_generate_content(
             payload, model, api_key
         ):
@@ -432,12 +505,21 @@ class OpenAIChatService:
                     usage_metadata = chunk.get("usageMetadata", {})
                 except json.JSONDecodeError:
                     logger.error(
-                        f"Failed to decode JSON from stream for model {model}: {chunk_str}"
+                        f"Request {req_id}: Failed to decode JSON from stream for model {model}: {chunk_str}"
                     )
                     continue
-                openai_chunk = self.response_handler.handle_response(
-                    chunk, model, stream=True, finish_reason=None, usage_metadata=usage_metadata
-                )
+                
+                try:
+                    openai_chunk = self.response_handler.handle_response(
+                        chunk, model, stream=True, finish_reason=None, usage_metadata=usage_metadata
+                    )
+                except ValueError as ve:
+                    # 捕获并重新抛出 "No parts found" 错误，让上层处理
+                    if "No parts found" in str(ve):
+                        logger.warning(f"Request {req_id}: {str(ve)}")
+                        raise ValueError(f"Request {req_id}: {str(ve)}")
+                    # 其他 ValueError 也重新抛出
+                    raise
                 if openai_chunk:
                     text = self._extract_text_from_openai_chunk(openai_chunk)
                     if text and settings.STREAM_OPTIMIZER_ENABLED:
@@ -448,11 +530,15 @@ class OpenAIChatService:
                             lambda t: self._create_char_openai_chunk(openai_chunk, t),
                             lambda c: f"data: {json.dumps(c)}\n\n",
                         ):
+                            # 标记已处理有效内容
+                            self._stream_had_content = True
                             yield optimized_chunk_data
                     else:
                         if openai_chunk.get("choices") and openai_chunk["choices"][0].get("delta", {}).get("tool_calls"):
                             tool_call_flag = True
 
+                        # 标记已处理有效内容
+                        self._stream_had_content = True
                         yield f"data: {json.dumps(openai_chunk)}\n\n"
 
         if tool_call_flag:
@@ -461,7 +547,7 @@ class OpenAIChatService:
             yield f"data: {json.dumps(self.response_handler.handle_response({}, model, stream=True, finish_reason='stop', usage_metadata=usage_metadata))}\n\n"
 
     async def _handle_stream_completion(
-        self, model: str, payload: Dict[str, Any], api_key: str
+        self, model: str, payload: Dict[str, Any], api_key: str, request_id: str = None
     ) -> AsyncGenerator[str, None]:
         """处理流式聊天完成，添加重试逻辑和假流式支持"""
         retries = 0
@@ -469,6 +555,7 @@ class OpenAIChatService:
         is_success = False
         status_code = None
         final_api_key = api_key
+        req_id = request_id or str(uuid.uuid4())  # 确保有请求ID
 
         while retries < max_retries:
             start_time = time.perf_counter()
@@ -479,25 +566,31 @@ class OpenAIChatService:
                 stream_generator = None
                 if settings.FAKE_STREAM_ENABLED:
                     logger.info(
-                        f"Using fake stream logic for model: {model}, Attempt: {retries + 1}"
+                        f"Request {req_id}: Using fake stream logic for model: {model}, Attempt: {retries + 1}"
                     )
                     stream_generator = self._fake_stream_logic_impl(
-                        model, payload, current_attempt_key
+                        model, payload, current_attempt_key, req_id
                     )
                 else:
                     logger.info(
-                        f"Using real stream logic for model: {model}, Attempt: {retries + 1}"
+                        f"Request {req_id}: Using real stream logic for model: {model}, Attempt: {retries + 1}"
                     )
                     stream_generator = self._real_stream_logic_impl(
-                        model, payload, current_attempt_key
+                        model, payload, current_attempt_key, req_id
                     )
 
                 async for chunk_data in stream_generator:
                     yield chunk_data
 
+                # 检查是否有实际内容返回
+                if not hasattr(self, '_stream_had_content') or self._stream_had_content is not True:
+                    logger.warning(f"Request {req_id}: No content was returned in the stream response")
+                    # 抛出异常以触发重试
+                    raise ValueError("No content was returned in the stream response")
+                
                 yield "data: [DONE]\n\n"
                 logger.info(
-                    f"Streaming completed successfully for model: {model}, FakeStream: {settings.FAKE_STREAM_ENABLED}, Attempt: {retries + 1}"
+                    f"Request {req_id}: Streaming completed successfully for model: {model}, FakeStream: {settings.FAKE_STREAM_ENABLED}, Attempt: {retries + 1}"
                 )
                 is_success = True
                 status_code = 200
@@ -508,7 +601,7 @@ class OpenAIChatService:
                 is_success = False
                 error_log_msg = str(e)
                 logger.warning(
-                    f"Streaming API call failed with error: {error_log_msg}. Attempt {retries} of {max_retries} with key {current_attempt_key}"
+                    f"Request {req_id}: Streaming API call failed with error: {error_log_msg}. Attempt {retries} of {max_retries} with key {current_attempt_key}"
                 )
 
                 match = re.search(r"status code (\d+)", error_log_msg)
@@ -519,6 +612,12 @@ class OpenAIChatService:
                         status_code = 408
                     else:
                         status_code = 500
+                
+                # 检查是否是"No parts found in stream response"错误
+                if "No parts found" in error_log_msg or "parts" in error_log_msg or "No content was returned" in error_log_msg:
+                    logger.warning(f"Request {req_id}: Detected 'No parts found' or 'No content' error, likely due to concurrent requests")
+                    # 增加额外延迟，避免立即重试导致的资源竞争
+                    await asyncio.sleep(1 + retries * 1.0)  # 更长的基础延迟和更大的增量
 
                 await add_error_log(
                     gemini_key=current_attempt_key,
@@ -531,27 +630,27 @@ class OpenAIChatService:
 
                 if self.key_manager:
                     new_api_key = await self.key_manager.handle_api_failure(
-                        current_attempt_key, retries
+                        current_attempt_key, retries, error_log_msg
                     )
                     if new_api_key and new_api_key != current_attempt_key:
                         final_api_key = new_api_key
                         logger.info(
-                            f"Switched to new API key for next attempt: {final_api_key}"
+                            f"Request {req_id}: Switched to new API key for next attempt: {final_api_key}"
                         )
                     elif not new_api_key:
                         logger.error(
-                            f"No valid API key available after {retries} retries, ceasing attempts for this request."
+                            f"Request {req_id}: No valid API key available after {retries} retries, ceasing attempts for this request."
                         )
                         break
                 else:
                     logger.error(
-                        "KeyManager not available, cannot switch API key. Ceasing attempts for this request."
+                        f"Request {req_id}: KeyManager not available, cannot switch API key. Ceasing attempts for this request."
                     )
                     break
 
                 if retries >= max_retries:
                     logger.error(
-                        f"Max retries ({max_retries}) reached for streaming model {model}."
+                        f"Request {req_id}: Max retries ({max_retries}) reached for streaming model {model}."
                     )
             finally:
                 end_time = time.perf_counter()

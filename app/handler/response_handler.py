@@ -170,6 +170,9 @@ def _extract_result(
             parts = content.get("parts", [])
             if not parts:
                 logger.warning("No parts found in stream response")
+                # 抛出异常以便上层处理
+                raise ValueError("No parts found in stream response")
+                # 这行代码不会执行，但保留以防异常被捕获
                 return "", None, [], None
             
             if "text" in parts[0]:

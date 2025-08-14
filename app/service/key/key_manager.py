@@ -112,14 +112,58 @@ class KeyManager:
             if current_key == initial_key:
                 return current_key
 
-    async def handle_api_failure(self, api_key: str, retries: int) -> str:
-        """处理API调用失败"""
+    async def handle_api_failure(self, api_key: str, retries: int, error_type: str = None) -> str:
+        """处理API调用失败
+        
+        Args:
+            api_key: 失败的API密钥
+            retries: 当前重试次数
+            error_type: 错误类型，用于智能处理不同类型的错误
+            
+        Returns:
+            新的API密钥，如果没有可用的密钥则返回空字符串
+        """
+        # 根据错误类型决定增加的失败计数
+        failure_increment = 1
+        
+        # 判断是否是并发请求问题
+        is_concurrent_issue = error_type and ("No parts found" in error_type or "parts" in error_type or "No content was returned" in error_type)
+        
+        # 对于并发限制或资源竞争类错误，使用更小的失败计数增量
+        if is_concurrent_issue:
+            failure_increment = 0.25  # 对于并发问题，只增加0.25个失败计数
+            logger.info(f"Detected concurrent request issue for key {redact_key_for_logging(api_key)}, using reduced failure increment (0.25)")
+        elif retries <= 1:  # 首次重试时使用较小的失败计数增量
+            failure_increment = 0.5
+            logger.info(f"First retry for key {redact_key_for_logging(api_key)}, using reduced failure increment (0.5)")
+        else:
+            logger.info(f"Multiple retries for key {redact_key_for_logging(api_key)}, using standard failure increment (1.0)")
+        
         async with self.failure_count_lock:
-            self.key_failure_counts[api_key] += 1
-            if self.key_failure_counts[api_key] >= self.MAX_FAILURES:
+            # 使用浮点数存储失败计数，以支持部分增量
+            current_count = self.key_failure_counts.get(api_key, 0)
+            new_count = current_count + failure_increment
+            self.key_failure_counts[api_key] = new_count
+            
+            if new_count >= self.MAX_FAILURES:
                 logger.warning(
                     f"API key {redact_key_for_logging(api_key)} has failed {self.MAX_FAILURES} times"
                 )
+        
+        # 如果是并发问题，可以考虑在一定时间后重试同一个密钥
+        if is_concurrent_issue:
+            # 对于并发问题，根据重试次数动态调整重用同一密钥的概率
+            reuse_probability = 0.6 if retries <= 1 else 0.4
+            if random.random() < reuse_probability:
+                logger.info(f"Reusing same key {redact_key_for_logging(api_key)} despite concurrent issue (probability: {reuse_probability})")
+                return api_key
+            else:
+                logger.info(f"Switching key despite concurrent issue (probability: {1-reuse_probability})")
+        # 对于首次重试的其他错误，也给予一定概率重用同一密钥
+        elif retries <= 1 and random.random() < 0.2:
+            logger.info(f"Reusing same key {redact_key_for_logging(api_key)} for first retry of non-concurrent error")
+            return api_key
+            
         if retries < settings.MAX_RETRIES:
             return await self.get_next_working_key()
         else:
