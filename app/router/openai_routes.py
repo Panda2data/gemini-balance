@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 from app.config.config import settings
+from typing import Optional
 from app.core.security import SecurityService
 from app.domain.openai_models import (
     ChatRequest,
@@ -72,14 +73,15 @@ async def list_models(
 async def chat_completion(
     request: ChatRequest,
     _=Depends(security_service.verify_authorization),
-    api_key: str = Depends(lambda: get_next_working_key_wrapper(model=request.model)),
+    api_key: Optional[str] = None,
     key_manager: KeyManager = Depends(get_key_manager),
     chat_service: OpenAIChatService = Depends(get_openai_chat_service),
 ):
     """处理 OpenAI 聊天补全请求，支持流式响应和特定模型切换。"""
     operation_name = "chat_completion"
     is_image_chat = request.model == f"{settings.CREATE_IMAGE_MODEL}-chat"
-    current_api_key = api_key
+    # 如果没有从重试机制传入 api_key，则根据模型获取一个可用 key
+    current_api_key = api_key or await key_manager.get_next_working_key(request.model)
     if is_image_chat:
         current_api_key = await key_manager.get_paid_key()
 

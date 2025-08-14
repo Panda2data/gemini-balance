@@ -126,7 +126,7 @@ def setup_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def general_exception_handler(request: Request, exc: Exception):
+    async def general_exception_handler(exc: Exception):
         """处理通用异常"""
         logger.exception(f"Unhandled Exception: {str(exc)}")
         return JSONResponse(
