@@ -72,6 +72,11 @@ class OpenAICompatiableService:
         status_code = None
         response = None
         try:
+            # 记录密钥使用情况
+            if self.key_manager and model in self.key_manager.model_rate_limits:
+                await self.key_manager.record_key_usage(api_key, model)
+                logger.info(f"Recorded key usage for model {model}")
+                
             response = await self.api_client.generate_content(request, api_key)
             is_success = True
             status_code = 200
@@ -123,6 +128,11 @@ class OpenAICompatiableService:
             current_attempt_key = api_key
             final_api_key = current_attempt_key
             try:
+                # 记录密钥使用情况
+                if self.key_manager and model in self.key_manager.model_rate_limits:
+                    await self.key_manager.record_key_usage(current_attempt_key, model)
+                    logger.info(f"Recorded key usage for model {model}")
+                    
                 async for line in self.api_client.stream_generate_content(
                     payload, current_attempt_key
                 ):
@@ -157,7 +167,7 @@ class OpenAICompatiableService:
 
                 if self.key_manager:
                     api_key = await self.key_manager.handle_api_failure(
-                        current_attempt_key, retries
+                        current_attempt_key, retries, model
                     )
                     if api_key:
                         logger.info(f"Switched to new API key: {redact_key_for_logging(api_key)}")

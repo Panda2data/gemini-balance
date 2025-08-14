@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Balance 项目文档</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: "Courier New", Courier, monospace;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin-bottom: 10px;
+        }
+        .tree, .tree ul, .tree li {
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+            position: relative;
+        }
+        .tree ul {
+            padding-left: 25px;
+            border-left: 1px dashed #ccc;
+        }
+        .tree li {
+            padding: 5px 0;
+            padding-left: 15px;
+        }
+        .tree li::before {
+            content: "├─";
+            position: absolute;
+            left: 0;
+            top: 5px;
+            color: #aaa;
+        }
+        .tree li:last-child::before {
+            content: "└─";
+        }
+        .tree code {
+            font-weight: bold;
+        }
+        .tree .description {
+            color: #555;
+            font-style: italic;
+            margin-left: 8px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Gemini Balance 项目使用说明</h1>
+
+    <h2>项目简介</h2>
+    <p>本项目是一个基于 FastAPI 的应用程序，其主要功能是作为 Google Gemini API 的代理和负载均衡器。它接收请求，并通过管理的API密钥池将它们转发到 Gemini API，从而实现负载均衡和密钥轮换。</p>
+
+    <h2>技术栈</h2>
+    <p>该项目使用了以下主要技术和库：</p>
+    <ul>
+        <li><strong>FastAPI</strong>: 用于构建 API 的高性能 Web 框架。</li>
+        <li><strong>Uvicorn</strong>: 用于运行 FastAPI 应用程序的 ASGI 服务器。</li>
+        <li><strong>google-genai</strong>: Google 官方提供的用于与 Gemini API 交互的 Python SDK。</li>
+        <li><strong>OpenAI</strong>: 用于兼容 OpenAI API 格式请求的官方 Python 库。</li>
+        <li><strong>SQLAlchemy</strong>: SQL 工具包和对象关系映射器（ORM），用于数据库操作。</li>
+        <li><strong>Httpx</strong>: 一个功能齐全的 HTTP 客户端，用于向外部 API 发出请求。</li>
+        <li><strong>Apscheduler</strong>: 用于在后台运行定时任务，例如定期检查 API 密钥的状态。</li>
+    </ul>
+
+    <h2>项目架构</h2>
+    <p>以下是项目的主要文件和目录结构说明：</p>
+    <div class="tree">
+        <ul>
+            <li>
+                <code>app/</code><span class="description">- 应用程序核心代码</span>
+                <ul>
+                    <li><code>main.py</code><span class="description">- FastAPI 应用主入口</span></li>
+                    <li><code>config/</code><span class="description">- 应用配置</span></li>
+                    <li>
+                        <code>router/</code><span class="description">- API 路由</span>
+                        <ul>
+                            <li><code>routes.py</code><span class="description">- 核心 API 路由定义</span></li>
+                        </ul>
+                    </li>
+                    <li>
+                        <code>service/</code><span class="description">- 业务逻辑</span>
+                        <ul>
+                            <li><code>chat/</code><span class="description">- 聊天服务</span></li>
+                            <li><code>key/</code><span class="description">- API 密钥管理</span></li>
+                        </ul>
+                    </li>
+                    <li><code>database/</code><span class="description">- 数据库连接和模型</span></li>
+                    <li><code>middleware/</code><span class="description">- FastAPI 中间件</span></li>
+                    <li><code>templates/</code><span class="description">- HTML 模板</span></li>
+                    <li><code>static/</code><span class="description">- 静态文件 (CSS, JS)</span></li>
+                </ul>
+            </li>
+        </ul>
+    </div>
+
+    <h2>本地开发和使用说明</h2>
+    <p>请按照以下步骤在本地环境中设置和运行此项目。</p>
+
+    <h3>1. 安装依赖</h3>
+    <p>首先，需要安装项目所需的所有 Python 包。在项目根目录下运行以下命令：</p>
+    <pre><code>pip install -r requirements.txt</code></pre>
+
+    <h3>2. 运行应用程序</h3>
+    <p>安装完依赖后，使用 Uvicorn 启动应用程序。此命令将以重载模式启动服务器，这意味着当代码发生更改时，服务器会自动重启。</p>
+    <pre><code>uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload</code></pre>
+    <p>服务器启动后，您可以通过浏览器或 API 工具访问 <code>http://localhost:8000</code> 来与应用交互。</p>
+
+</body>
+</html>

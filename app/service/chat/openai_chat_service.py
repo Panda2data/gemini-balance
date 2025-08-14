@@ -306,6 +306,11 @@ class OpenAIChatService:
         req_id = request_id or str(uuid.uuid4())  # 确保有请求ID
         
         try:
+            # 记录密钥使用情况
+            if self.key_manager and model in self.key_manager.model_rate_limits:
+                await self.key_manager.record_key_usage(api_key, model)
+                logger.info(f"Request {req_id}: Recorded key usage for model {model}")
+                
             logger.info(f"Request {req_id}: Sending non-streaming request to model {model}")
             response = await self.api_client.generate_content(payload, model, api_key)
             usage_metadata = response.get("usageMetadata", {})
@@ -418,6 +423,11 @@ class OpenAIChatService:
         keep_sending_empty_data = True
         # 重置内容标记
         self._stream_had_content = False
+        
+        # 记录密钥使用情况
+        if self.key_manager and model in self.key_manager.model_rate_limits:
+            await self.key_manager.record_key_usage(api_key, model)
+            logger.info(f"Request {req_id}: Recorded key usage for model {model}")
 
         async def send_empty_data_locally() -> AsyncGenerator[str, None]:
             """定期发送空数据以保持连接"""
@@ -490,6 +500,12 @@ class OpenAIChatService:
         usage_metadata = None
         # 重置内容标记
         self._stream_had_content = False
+        
+        # 记录密钥使用情况
+        if self.key_manager and model in self.key_manager.model_rate_limits:
+            await self.key_manager.record_key_usage(api_key, model)
+            logger.info(f"Request {req_id}: Recorded key usage for model {model}")
+            
         async for line in self.api_client.stream_generate_content(
             payload, model, api_key
         ):
@@ -630,7 +646,7 @@ class OpenAIChatService:
 
                 if self.key_manager:
                     new_api_key = await self.key_manager.handle_api_failure(
-                        current_attempt_key, retries, error_log_msg
+                        current_attempt_key, retries, error_log_msg, model
                     )
                     if new_api_key and new_api_key != current_attempt_key:
                         final_api_key = new_api_key

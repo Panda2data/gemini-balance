@@ -1,7 +1,9 @@
 import asyncio
 import random
+import time
 from itertools import cycle
-from typing import Dict, Union
+from typing import Dict, Union, List, Tuple
+from collections import defaultdict
 
 from app.config.config import settings
 from app.log.logger import get_key_manager_logger
@@ -20,9 +22,17 @@ class KeyManager:
         self.vertex_key_cycle_lock = asyncio.Lock()
         self.failure_count_lock = asyncio.Lock()
         self.vertex_failure_count_lock = asyncio.Lock()
+        self.key_usage_lock = asyncio.Lock()
         self.key_failure_counts: Dict[str, int] = {key: 0 for key in api_keys}
         self.vertex_key_failure_counts: Dict[str, int] = {
             key: 0 for key in vertex_api_keys
+        }
+        # 存储密钥使用时间戳的字典，用于实现冷却期
+        # 格式: {key: {model: [timestamp1, timestamp2, ...]}}
+        self.key_usage_timestamps: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
+        # 模型特定的速率限制配置 {model: requests_per_minute}
+        self.model_rate_limits = {
+            "gemini-2.5-pro": 4  # gemini-2.5-pro 模型每分钟最多4次请求
         }
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
@@ -86,18 +96,49 @@ class KeyManager:
             )
             return False
 
-    async def get_next_working_key(self) -> str:
-        """获取下一可用的API key"""
+    async def get_next_working_key(self, model: str = None) -> str:
+        """获取下一可用的API key，考虑冷却期限制
+        
+        Args:
+            model: 请求的模型名称，用于检查模型特定的速率限制
+            
+        Returns:
+            可用的API密钥
+        """
         initial_key = await self.get_next_key()
         current_key = initial_key
+        attempts = 0
+        max_attempts = len(self.api_keys) * 2  # 避免无限循环
 
-        while True:
+        while attempts < max_attempts:
+            # 检查密钥是否有效（失败计数未超过阈值）
             if await self.is_key_valid(current_key):
+                # 如果指定了模型，检查该密钥是否在冷却期内
+                if model and model in self.model_rate_limits:
+                    if await self.is_key_in_cooldown(current_key, model):
+                        logger.info(f"Key {redact_key_for_logging(current_key)} is in cooldown for model {model}, trying next key")
+                        current_key = await self.get_next_key()
+                        attempts += 1
+                        continue
+                
+                # 密钥有效且不在冷却期内
                 return current_key
 
             current_key = await self.get_next_key()
-            if current_key == initial_key:
+            attempts += 1
+            if current_key == initial_key and attempts > len(self.api_keys):
+                # 如果已经循环了一圈还没找到可用密钥，可能所有密钥都在冷却期
+                # 此时返回冷却时间最短的密钥
+                if model and model in self.model_rate_limits:
+                    cooldown_key = await self.get_key_with_shortest_cooldown(model)
+                    if cooldown_key:
+                        logger.info(f"All keys in cooldown for model {model}, using key with shortest cooldown")
+                        return cooldown_key
                 return current_key
+        
+        # 如果尝试次数过多，返回初始密钥
+        logger.warning(f"Could not find available key after {max_attempts} attempts, returning initial key")
+        return initial_key
 
     async def get_next_working_vertex_key(self) -> str:
         """获取下一可用的 Vertex Express API key"""
@@ -112,13 +153,103 @@ class KeyManager:
             if current_key == initial_key:
                 return current_key
 
-    async def handle_api_failure(self, api_key: str, retries: int, error_type: str = None) -> str:
+    async def is_key_in_cooldown(self, api_key: str, model: str) -> bool:
+        """检查密钥是否在冷却期内
+        
+        Args:
+            api_key: 要检查的API密钥
+            model: 模型名称
+            
+        Returns:
+            如果密钥在冷却期内返回True，否则返回False
+        """
+        if model not in self.model_rate_limits:
+            return False
+            
+        rate_limit = self.model_rate_limits[model]  # 每分钟允许的请求数
+        cooldown_window = 60.0  # 冷却窗口为60秒（1分钟）
+        
+        async with self.key_usage_lock:
+            # 获取该密钥对该模型的使用时间戳
+            timestamps = self.key_usage_timestamps[api_key][model]
+            
+            # 清理过期的时间戳（超过冷却窗口的）
+            current_time = time.time()
+            valid_timestamps = [ts for ts in timestamps if current_time - ts < cooldown_window]
+            self.key_usage_timestamps[api_key][model] = valid_timestamps
+            
+            # 如果在冷却窗口内的请求数量已达到限制，则密钥在冷却期内
+            return len(valid_timestamps) >= rate_limit
+    
+    async def record_key_usage(self, api_key: str, model: str) -> None:
+        """记录密钥使用情况
+        
+        Args:
+            api_key: 使用的API密钥
+            model: 使用的模型名称
+        """
+        async with self.key_usage_lock:
+            current_time = time.time()
+            self.key_usage_timestamps[api_key][model].append(current_time)
+            
+            # 记录日志
+            if model in self.model_rate_limits:
+                count = len(self.key_usage_timestamps[api_key][model])
+                limit = self.model_rate_limits[model]
+                logger.info(f"Key {redact_key_for_logging(api_key)} used for model {model}: {count}/{limit} requests in current window")
+    
+    async def get_key_with_shortest_cooldown(self, model: str) -> str:
+        """获取冷却时间最短的密钥
+        
+        Args:
+            model: 模型名称
+            
+        Returns:
+            冷却时间最短的密钥
+        """
+        if model not in self.model_rate_limits:
+            return await self.get_first_valid_key()
+            
+        rate_limit = self.model_rate_limits[model]
+        cooldown_window = 60.0  # 冷却窗口为60秒
+        current_time = time.time()
+        
+        best_key = None
+        min_wait_time = float('inf')
+        
+        async with self.key_usage_lock:
+            for key in self.api_keys:
+                # 跳过无效密钥
+                if self.key_failure_counts.get(key, 0) >= self.MAX_FAILURES:
+                    continue
+                    
+                timestamps = self.key_usage_timestamps[key][model]
+                valid_timestamps = [ts for ts in timestamps if current_time - ts < cooldown_window]
+                
+                # 如果请求数未达到限制，可以立即使用
+                if len(valid_timestamps) < rate_limit:
+                    return key
+                    
+                # 计算最早可用时间
+                if valid_timestamps:
+                    # 按时间排序
+                    valid_timestamps.sort()
+                    # 最早的时间戳过期后可以发送新请求
+                    wait_time = (valid_timestamps[0] + cooldown_window) - current_time
+                    if wait_time < min_wait_time:
+                        min_wait_time = wait_time
+                        best_key = key
+        
+        return best_key if best_key else await self.get_first_valid_key()
+    
+    async def handle_api_failure(self, api_key: str, retries: int, error_type: str = None, model: str = None) -> str:
         """处理API调用失败
         
         Args:
             api_key: 失败的API密钥
             retries: 当前重试次数
             error_type: 错误类型，用于智能处理不同类型的错误
+            model: 请求的模型名称，用于检查模型特定的速率限制
             
         Returns:
             新的API密钥，如果没有可用的密钥则返回空字符串
@@ -165,7 +296,7 @@ class KeyManager:
             return api_key
             
         if retries < settings.MAX_RETRIES:
-            return await self.get_next_working_key()
+            return await self.get_next_working_key(model)
         else:
             return ""
 

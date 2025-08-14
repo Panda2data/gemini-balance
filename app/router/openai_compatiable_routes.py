@@ -27,8 +27,9 @@ async def get_key_manager():
 
 async def get_next_working_key_wrapper(
     key_manager: KeyManager = Depends(get_key_manager),
+    model: str = None,
 ):
-    return await key_manager.get_next_working_key()
+    return await key_manager.get_next_working_key(model)
 
 
 async def get_openai_service(key_manager: KeyManager = Depends(get_key_manager)):
@@ -56,7 +57,7 @@ async def list_models(
 async def chat_completion(
     request: ChatRequest,
     _=Depends(security_service.verify_authorization),
-    api_key: str = Depends(get_next_working_key_wrapper),
+    api_key: str = Depends(lambda: get_next_working_key_wrapper(model=request.model)),
     key_manager: KeyManager = Depends(get_key_manager),
     openai_service: OpenAICompatiableService = Depends(get_openai_service),
 ):
